@@ -8,7 +8,7 @@ import Security
 import ServiceManagement
 
 let APP_NAME = "Pulse for Claude"
-let APP_VERSION = "1.0.0"
+let APP_VERSION = "1.0.2"
 let USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 let TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 let COST_URL = "https://api.anthropic.com/v1/organizations/cost_report"
@@ -17,6 +17,10 @@ let OAUTH_BETA = "oauth-2025-04-20"
 let USER_AGENT = "claude-cli/2.1.0 (external, cli)"
 let CC_KEYCHAIN_SERVICE = "Claude Code-credentials"
 let PULSE_KEYCHAIN_SERVICE = "club.everydayai.pulse"
+// Pulse's OWN keychain item. Because Pulse creates it, Pulse can read and
+// write it with no macOS permission prompt, ever. The Claude Code item above
+// is only read once, to seed this one.
+let PULSE_CRED_SERVICE = "Pulse for Claude-credentials"
 let CRED_FILE = NSString(string: "~/.claude/.credentials.json").expandingTildeInPath
 let PROJECTS_DIR = NSString(string: "~/.claude/projects").expandingTildeInPath
 
@@ -180,137 +184,194 @@ enum PulseError: Error, CustomStringConvertible {
     }
 }
 
-// MARK: - Credentials (read Claude Code's OAuth login, refresh when stale)
+// MARK: - Credentials
 
+// THE OWNERSHIP FIX. Pulse keeps its OWN keychain item (PULSE_CRED_SERVICE).
+// An app can always read and write a keychain item it created, with no macOS
+// permission prompt. Claude Code's item is read exactly once, to seed ours,
+// which is the only time the user ever sees the keychain dialog. After that
+// every read, refresh, and write happens against our own item, so the prompts
+// stop completely.
+//
+// All token state lives behind one serial queue, so only one network refresh
+// can ever be in flight (kills the double-spend 404 race), and the freshest
+// token is held in memory as the source of truth.
 final class Credentials {
-    private(set) var accessToken: String = ""
-    private(set) var refreshToken: String = ""
-    private(set) var expiresAt: Double = 0
-    private var keychainJSON: [String: Any]?
-    private var keychainAccount: String = ""
-    private var fileJSON: [String: Any]?
-    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "club.everydayai.pulse.token")
+    private var accessToken: String = ""
+    private var refreshToken: String = ""
+    private var expiresAt: Double = 0
+    private var loadedOnce = false
+    private var ownItemAccess = "" // access token currently stored in our own item
 
-    var isExpired: Bool {
-        return Date().timeIntervalSince1970 * 1000 > (expiresAt - 60_000)
+    private var isExpiredLocked: Bool {
+        // treat as expired 90s early so we never send a token that dies mid-flight
+        return Date().timeIntervalSince1970 * 1000 > (expiresAt - 90_000)
     }
 
-    // Reads both stores and keeps whichever token is freshest.
-    func load() -> Bool {
-        var best: (oauth: [String: Any], exp: Double)?
-        if let kc = keychainRead(service: CC_KEYCHAIN_SERVICE),
-           let json = (try? JSONSerialization.jsonObject(with: kc.data)) as? [String: Any] {
-            keychainJSON = json
-            keychainAccount = kc.account
-            if let o = json["claudeAiOauth"] as? [String: Any] {
-                let exp = (o["expiresAt"] as? NSNumber)?.doubleValue ?? 0
-                if best == nil || exp > best!.exp { best = (o, exp) }
-            }
-        }
-        if let data = FileManager.default.contents(atPath: CRED_FILE),
-           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-            fileJSON = json
-            if let o = json["claudeAiOauth"] as? [String: Any] {
-                let exp = (o["expiresAt"] as? NSNumber)?.doubleValue ?? 0
-                if best == nil || exp > best!.exp { best = (o, exp) }
-            }
-        }
-        guard let chosen = best,
-              let at = chosen.oauth["accessToken"] as? String,
-              let rt = chosen.oauth["refreshToken"] as? String else { return false }
-        accessToken = at
-        refreshToken = rt
-        expiresAt = chosen.exp
-        return true
+    private func readOAuth(service: String) -> (at: String, rt: String, exp: Double)? {
+        guard let kc = keychainRead(service: service),
+              let json = (try? JSONSerialization.jsonObject(with: kc.data)) as? [String: Any],
+              let o = json["claudeAiOauth"] as? [String: Any],
+              let at = o["accessToken"] as? String,
+              let rt = o["refreshToken"] as? String else { return nil }
+        return (at, rt, (o["expiresAt"] as? NSNumber)?.doubleValue ?? 0)
     }
 
-    // Exchanges the refresh token for a new access token, then writes the new
-    // credentials back to every store Claude Code uses, in the same format,
-    // so Claude Code itself stays logged in. Refresh tokens rotate, which is
-    // why the write-back is not optional.
-    func refresh() -> PulseError? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard load() else { return .noCredentials }
-        if !isExpired { return nil }
+    private func readFileOAuth() -> (at: String, rt: String, exp: Double)? {
+        guard let data = FileManager.default.contents(atPath: CRED_FILE),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let o = json["claudeAiOauth"] as? [String: Any],
+              let at = o["accessToken"] as? String,
+              let rt = o["refreshToken"] as? String else { return nil }
+        return (at, rt, (o["expiresAt"] as? NSNumber)?.doubleValue ?? 0)
+    }
 
-        var lastError: PulseError = .loginExpired
+    private func adopt(_ t: (at: String, rt: String, exp: Double)?, orNewer: Bool) {
+        guard let t = t else { return }
+        let fresher = orNewer ? (t.exp > expiresAt) : (t.exp >= expiresAt)
+        if accessToken.isEmpty || fresher {
+            accessToken = t.at; refreshToken = t.rt; expiresAt = t.exp
+        }
+    }
+
+    // Loads the freshest usable token. Our OWN item is always checked (free, no
+    // prompt). Claude Code's item and the file are consulted ONLY when allowed
+    // and only when we still lack a usable token, so in steady state the
+    // keychain dialog never appears.
+    private func loadLocked(allowSeed: Bool) {
+        let own = readOAuth(service: PULSE_CRED_SERVICE)
+        ownItemAccess = own?.at ?? ""
+        adopt(own, orNewer: false)
+        if allowSeed && (accessToken.isEmpty || isExpiredLocked) {
+            adopt(readOAuth(service: CC_KEYCHAIN_SERVICE), orNewer: true)
+            adopt(readFileOAuth(), orNewer: true)
+        }
+        loadedOnce = true
+    }
+
+    // Copies the live token into our own item if it is not already there. This
+    // is what makes the very first run seed the owned item immediately, so the
+    // Claude Code dialog is never seen again even if no refresh has happened.
+    private func persistOwnLocked() {
+        if !accessToken.isEmpty && ownItemAccess != accessToken { writeBackLocked() }
+    }
+
+    // The one entry point. Returns a currently-valid access token, refreshing
+    // at most once. Serialized so concurrent callers can never double-refresh.
+    func validAccessToken() -> Result<String, PulseError> {
+        return queue.sync {
+            if !loadedOnce || accessToken.isEmpty { loadLocked(allowSeed: true) }
+            if accessToken.isEmpty { return .failure(.noCredentials) }
+            if !isExpiredLocked { persistOwnLocked(); return .success(accessToken) }
+            return refreshLocked()
+        }
+    }
+
+    // Forces a refresh even if the in-memory token looks valid. Used when a
+    // usage call is rejected with 401 despite a token we believed was good.
+    func forceRefresh() -> Result<String, PulseError> {
+        return queue.sync { return refreshLocked() }
+    }
+
+    // MUST be called on `queue`. Single-flight refresh. Tries our own token
+    // first (no prompt); only falls back to seeding from Claude Code's item if
+    // ours is gone, which is the lone case that can surface a prompt.
+    private func refreshLocked() -> Result<String, PulseError> {
+        loadLocked(allowSeed: false)
+        if !accessToken.isEmpty && !isExpiredLocked { return .success(accessToken) }
+        if refreshToken.isEmpty {
+            loadLocked(allowSeed: true)
+            if !accessToken.isEmpty && !isExpiredLocked { return .success(accessToken) }
+            if refreshToken.isEmpty { return .failure(.noCredentials) }
+        }
+
+        var lastError = PulseError.loginExpired
         for attempt in 0..<2 {
             if attempt > 0 {
-                _ = load() // someone else (Claude Code) may have rotated it first
-                if !isExpired { return nil }
+                // Our refresh token was rejected (already spent, or Claude Code
+                // rotated it). Re-seed from Claude Code's item and retry once.
+                loadLocked(allowSeed: true)
+                if !accessToken.isEmpty && !isExpiredLocked { return .success(accessToken) }
             }
-            var req = URLRequest(url: URL(string: TOKEN_URL)!)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue(USER_AGENT, forHTTPHeaderField: "User-Agent")
-            let body: [String: Any] = [
-                "grant_type": "refresh_token",
-                "refresh_token": refreshToken,
-                "client_id": OAUTH_CLIENT_ID,
-            ]
-            req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-            req.timeoutInterval = 20
-
-            let sem = DispatchSemaphore(value: 0)
-            var result: (Data?, URLResponse?, Error?)
-            URLSession.shared.dataTask(with: req) { d, r, e in
-                result = (d, r, e)
-                sem.signal()
-            }.resume()
-            sem.wait()
-
-            if let e = result.2 {
-                lastError = .network(e.localizedDescription)
-                continue
+            switch postRefresh(refreshToken) {
+            case .success(let t):
+                accessToken = t.access
+                refreshToken = t.refresh
+                expiresAt = t.exp
+                writeBackLocked()
+                return .success(accessToken)
+            case .failure(let e):
+                lastError = e
             }
-            guard let http = result.1 as? HTTPURLResponse, let data = result.0 else {
-                lastError = .network("No response")
-                continue
-            }
-            if http.statusCode != 200 {
-                lastError = .loginExpired
-                continue
-            }
-            guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let newAccess = json["access_token"] as? String else {
-                lastError = .network("Bad token response")
-                continue
-            }
-            let newRefresh = (json["refresh_token"] as? String) ?? refreshToken
-            let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 3600
-            let newExp = Date().timeIntervalSince1970 * 1000 + expiresIn * 1000
-            accessToken = newAccess
-            refreshToken = newRefresh
-            expiresAt = newExp
-            writeBack()
-            return nil
         }
-        return lastError
+        return .failure(lastError)
     }
 
-    private func writeBack() {
-        let fields: [String: Any] = [
+    private struct NewToken { let access: String; let refresh: String; let exp: Double }
+
+    private func postRefresh(_ rt: String) -> Result<NewToken, PulseError> {
+        var req = URLRequest(url: URL(string: TOKEN_URL)!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(USER_AGENT, forHTTPHeaderField: "User-Agent")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": OAUTH_CLIENT_ID,
+        ])
+        req.timeoutInterval = 20
+
+        let sem = DispatchSemaphore(value: 0)
+        var result: (Data?, URLResponse?, Error?)
+        URLSession.shared.dataTask(with: req) { d, r, e in result = (d, r, e); sem.signal() }.resume()
+        sem.wait()
+
+        if let e = result.2 { return .failure(.network(e.localizedDescription)) }
+        guard let http = result.1 as? HTTPURLResponse, let data = result.0 else {
+            return .failure(.network("No response"))
+        }
+        guard http.statusCode == 200,
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let newAccess = json["access_token"] as? String else {
+            // 4xx here means the refresh token is gone or already spent.
+            return .failure(.loginExpired)
+        }
+        let newRefresh = (json["refresh_token"] as? String) ?? rt
+        let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 3600
+        let exp = Date().timeIntervalSince1970 * 1000 + expiresIn * 1000
+        return .success(NewToken(access: newAccess, refresh: newRefresh, exp: exp))
+    }
+
+    // Saves the current token to Pulse's OWN keychain item (always free, never
+    // prompts) and best-effort to the file. It deliberately does NOT write
+    // Claude Code's item, because writing a borrowed item is exactly what
+    // triggered the repeating permission dialog. MUST be called on `queue`.
+    private func writeBackLocked() {
+        let payload: [String: Any] = ["claudeAiOauth": [
             "accessToken": accessToken,
             "refreshToken": refreshToken,
             "expiresAt": expiresAt,
-        ]
-        if var json = keychainJSON {
-            var oauth = (json["claudeAiOauth"] as? [String: Any]) ?? [:]
-            for (k, v) in fields { oauth[k] = v }
-            json["claudeAiOauth"] = oauth
-            keychainJSON = json
-            if let data = try? JSONSerialization.data(withJSONObject: json) {
-                keychainWrite(service: CC_KEYCHAIN_SERVICE, account: keychainAccount, data: data)
+        ]]
+        if let data = try? JSONSerialization.data(withJSONObject: payload) {
+            if keychainWrite(service: PULSE_CRED_SERVICE, account: NSUserName(), data: data) {
+                ownItemAccess = accessToken
             }
         }
-        if var json = fileJSON {
+        // Best-effort file sync so the value is also visible to tooling that
+        // reads ~/.claude/.credentials.json. Failure here is harmless.
+        if let data0 = FileManager.default.contents(atPath: CRED_FILE),
+           var json = (try? JSONSerialization.jsonObject(with: data0)) as? [String: Any] {
             var oauth = (json["claudeAiOauth"] as? [String: Any]) ?? [:]
-            for (k, v) in fields { oauth[k] = v }
+            oauth["accessToken"] = accessToken
+            oauth["refreshToken"] = refreshToken
+            oauth["expiresAt"] = expiresAt
             json["claudeAiOauth"] = oauth
-            fileJSON = json
             if let data = try? JSONSerialization.data(withJSONObject: json) {
-                try? data.write(to: URL(fileURLWithPath: CRED_FILE), options: .atomic)
+                let url = URL(fileURLWithPath: CRED_FILE)
+                if (try? data.write(to: url, options: .atomic)) == nil {
+                    try? data.write(to: url)
+                }
                 try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: CRED_FILE)
             }
         }
@@ -329,24 +390,31 @@ final class UsageFetcher {
     }
 
     private func fetchSync() -> Result<UsageSnapshot, PulseError> {
-        guard credentials.load() else { return .failure(.noCredentials) }
-        if credentials.isExpired {
-            if let err = credentials.refresh() { return .failure(err) }
+        let tokenResult = credentials.validAccessToken()
+        guard case .success(let token) = tokenResult else {
+            if case .failure(let e) = tokenResult { return .failure(e) }
+            return .failure(.loginExpired)
         }
-        switch request() {
+        switch request(token: token) {
         case .success(let snap):
             return .success(snap)
         case .failure(.loginExpired):
-            if let err = credentials.refresh() { return .failure(err) }
-            return request()
+            // Token was rejected despite looking valid. Force exactly one
+            // refresh and retry; if that also fails, surface login expired.
+            let retry = credentials.forceRefresh()
+            guard case .success(let token2) = retry else {
+                if case .failure(let e) = retry { return .failure(e) }
+                return .failure(.loginExpired)
+            }
+            return request(token: token2)
         case .failure(let other):
             return .failure(other)
         }
     }
 
-    private func request() -> Result<UsageSnapshot, PulseError> {
+    private func request(token: String) -> Result<UsageSnapshot, PulseError> {
         var req = URLRequest(url: URL(string: USAGE_URL)!)
-        req.setValue("Bearer " + credentials.accessToken, forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         req.setValue(OAUTH_BETA, forHTTPHeaderField: "anthropic-beta")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(USER_AGENT, forHTTPHeaderField: "User-Agent")

@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.0.0"
+VERSION="1.0.2"
 NAME="Pulse for Claude"
 BUNDLE_ID="club.everydayai.pulse"
 BUILD_DIR="build"
