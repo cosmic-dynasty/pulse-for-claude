@@ -8,7 +8,7 @@ import Security
 import ServiceManagement
 
 let APP_NAME = "Pulse for Claude"
-let APP_VERSION = "1.0.2"
+let APP_VERSION = "1.0.3"
 let USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 let TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 let COST_URL = "https://api.anthropic.com/v1/organizations/cost_report"
@@ -240,21 +240,22 @@ final class Credentials {
     // and only when we still lack a usable token, so in steady state the
     // keychain dialog never appears.
     private func loadLocked(allowSeed: Bool) {
-        let own = readOAuth(service: PULSE_CRED_SERVICE)
-        ownItemAccess = own?.at ?? ""
-        adopt(own, orNewer: false)
+        // FILE first: reading a file never raises a keychain dialog. Pulse keeps
+        // this file current on every refresh, so in normal use the keychain is
+        // never touched and the password box never appears, even after updates.
+        adopt(readFileOAuth(), orNewer: false)
+        // Only fall back to the keychain when the file cannot help (first run on
+        // a machine where Claude Code stored its login only in the keychain).
         if allowSeed && (accessToken.isEmpty || isExpiredLocked) {
             adopt(readOAuth(service: CC_KEYCHAIN_SERVICE), orNewer: true)
-            adopt(readFileOAuth(), orNewer: true)
         }
         loadedOnce = true
     }
 
-    // Copies the live token into our own item if it is not already there. This
-    // is what makes the very first run seed the owned item immediately, so the
-    // Claude Code dialog is never seen again even if no refresh has happened.
-    private func persistOwnLocked() {
-        if !accessToken.isEmpty && ownItemAccess != accessToken { writeBackLocked() }
+    // Makes sure the prompt-free file holds the current token (seeding it from
+    // the keychain on first run), so later loads are file-only and silent.
+    private func persistFileLocked() {
+        if !accessToken.isEmpty && (readFileOAuth()?.at ?? "") != accessToken { writeBackLocked() }
     }
 
     // The one entry point. Returns a currently-valid access token, refreshing
@@ -263,7 +264,7 @@ final class Credentials {
         return queue.sync {
             if !loadedOnce || accessToken.isEmpty { loadLocked(allowSeed: true) }
             if accessToken.isEmpty { return .failure(.noCredentials) }
-            if !isExpiredLocked { persistOwnLocked(); return .success(accessToken) }
+            if !isExpiredLocked { persistFileLocked(); return .success(accessToken) }
             return refreshLocked()
         }
     }
@@ -343,37 +344,54 @@ final class Credentials {
         return .success(NewToken(access: newAccess, refresh: newRefresh, exp: exp))
     }
 
-    // Saves the current token to Pulse's OWN keychain item (always free, never
-    // prompts) and best-effort to the file. It deliberately does NOT write
-    // Claude Code's item, because writing a borrowed item is exactly what
-    // triggered the repeating permission dialog. MUST be called on `queue`.
+    // Saves the current token to the file Pulse reads (~/.claude/.credentials.json).
+    // Writing a file never raises a keychain dialog, and Pulse reads the file
+    // first, so this keeps the app prompt-free. It preserves any other keys
+    // already in the file. MUST be called on `queue`.
     private func writeBackLocked() {
-        let payload: [String: Any] = ["claudeAiOauth": [
-            "accessToken": accessToken,
-            "refreshToken": refreshToken,
-            "expiresAt": expiresAt,
-        ]]
-        if let data = try? JSONSerialization.data(withJSONObject: payload) {
-            if keychainWrite(service: PULSE_CRED_SERVICE, account: NSUserName(), data: data) {
-                ownItemAccess = accessToken
-            }
-        }
-        // Best-effort file sync so the value is also visible to tooling that
-        // reads ~/.claude/.credentials.json. Failure here is harmless.
+        var json: [String: Any] = [:]
         if let data0 = FileManager.default.contents(atPath: CRED_FILE),
-           var json = (try? JSONSerialization.jsonObject(with: data0)) as? [String: Any] {
-            var oauth = (json["claudeAiOauth"] as? [String: Any]) ?? [:]
-            oauth["accessToken"] = accessToken
-            oauth["refreshToken"] = refreshToken
-            oauth["expiresAt"] = expiresAt
-            json["claudeAiOauth"] = oauth
-            if let data = try? JSONSerialization.data(withJSONObject: json) {
-                let url = URL(fileURLWithPath: CRED_FILE)
-                if (try? data.write(to: url, options: .atomic)) == nil {
-                    try? data.write(to: url)
-                }
-                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: CRED_FILE)
-            }
+           let existing = (try? JSONSerialization.jsonObject(with: data0)) as? [String: Any] {
+            json = existing
+        }
+        var oauth = (json["claudeAiOauth"] as? [String: Any]) ?? [:]
+        oauth["accessToken"] = accessToken
+        oauth["refreshToken"] = refreshToken
+        oauth["expiresAt"] = expiresAt
+        json["claudeAiOauth"] = oauth
+        if let data = try? JSONSerialization.data(withJSONObject: json) {
+            let url = URL(fileURLWithPath: CRED_FILE)
+            if (try? data.write(to: url, options: .atomic)) == nil { try? data.write(to: url) }
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: CRED_FILE)
+        }
+    }
+
+    // Runs Claude Code's own sign-in (the correct, official flow) to mint a
+    // fresh login, then copies it into the file Pulse reads. This is what the
+    // Reconnect button and a failed Refresh call invoke. Returns true on a
+    // verifiable fresh token. Safe to call off the main thread.
+    func reconnectViaClaudeCLI() -> Bool {
+        let home = NSHomeDirectory()
+        let candidates = [home + "/.claude/local/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"]
+        let claude = candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+        guard let claudeBin = claude else { return false }
+        let credPath = home + "/.claude/.credentials.json"
+        // 1) sign in (opens the browser, completes via the existing claude.com
+        //    session). 2) copy the fresh login from the keychain into the file,
+        //    using the `security` tool, which is already trusted for that item,
+        //    so no dialog appears.
+        let script = "\"\(claudeBin)\" auth login < /dev/null > /dev/null 2>&1; "
+            + "/usr/bin/security find-generic-password -s 'Claude Code-credentials' -w > \"\(credPath).pulsetmp\" 2>/dev/null "
+            + "&& /bin/mv \"\(credPath).pulsetmp\" \"\(credPath)\" && /bin/chmod 600 \"\(credPath)\""
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/bash")
+        task.arguments = ["-lc", script]
+        do { try task.run() } catch { return false }
+        task.waitUntilExit()
+        return queue.sync {
+            accessToken = ""; expiresAt = 0; loadedOnce = false
+            loadLocked(allowSeed: true)
+            return !accessToken.isEmpty && !isExpiredLocked
         }
     }
 }
@@ -834,6 +852,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var spendLine: String = ""
     var pulsePhase = false
     var sparkPhase = false
+    var reconnecting = false
     static let positionKey = "NSStatusItem Preferred Position Pulse"
 
     var iconStyle: IconStyle {
@@ -1007,13 +1026,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         header.isEnabled = false
         menu.addItem(header)
 
-        if let err = lastError, snapshot == nil {
+        if reconnecting {
+            menu.addItem(infoItem("Reconnecting to Claude…"))
+        } else if let err = lastError, snapshot == nil {
             menu.addItem(infoItem(err.description))
             switch err {
             case .noCredentials:
-                menu.addItem(infoItem("Install Claude Code, run it once, and log in."))
+                menu.addItem(infoItem("Install Claude Code, sign in once, then Reconnect."))
+                addReconnectItem()
             case .loginExpired:
-                menu.addItem(infoItem("Open Claude Code once, then hit Refresh."))
+                menu.addItem(infoItem("Your Claude login expired. One click fixes it:"))
+                addReconnectItem()
             case .network:
                 menu.addItem(infoItem("Check your internet connection, then Refresh."))
             }
@@ -1037,8 +1060,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.view = barRow(label: "Usage credits", pct: pct, sub: "\(used) of \(limit) extra usage", fillColor: claudeCoral)
                 menu.addItem(item)
             }
-            if let stalenessErr = lastError {
+            if let stalenessErr = lastError, !reconnecting {
                 menu.addItem(infoItem("Last update failed: \(stalenessErr.description)"))
+                if case .loginExpired = stalenessErr { addReconnectItem() }
+            } else if reconnecting {
+                menu.addItem(infoItem("Reconnecting to Claude…"))
             }
         }
 
@@ -1116,6 +1142,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh.target = self
         menu.addItem(refresh)
 
+        let reconnectItem = NSMenuItem(title: "Reconnect to Claude", action: #selector(reconnectAction), keyEquivalent: "")
+        reconnectItem.target = self
+        reconnectItem.isEnabled = !reconnecting
+        menu.addItem(reconnectItem)
+
         let openUsage = NSMenuItem(title: "Open Usage Settings on claude.ai", action: #selector(openClaudeUsage), keyEquivalent: "")
         openUsage.target = self
         menu.addItem(openUsage)
@@ -1177,9 +1208,58 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func manualRefresh() {
+        // If the login is dead, retrying it does nothing. The useful action is
+        // to reconnect, so Refresh Now does exactly that in that situation.
+        let loginDead: Bool = {
+            if case .loginExpired? = lastError { return true }
+            if case .noCredentials? = lastError { return true }
+            return false
+        }()
+        if loginDead {
+            reconnectAction()
+            return
+        }
         refreshUsage()
         refreshModels()
         refreshSpend()
+    }
+
+    // Adds a bold, obvious Reconnect button into the menu's error area.
+    func addReconnectItem() {
+        let item = NSMenuItem(title: reconnecting ? "Reconnecting…" : "Reconnect to Claude", action: #selector(reconnectAction), keyEquivalent: "")
+        item.target = self
+        item.isEnabled = !reconnecting
+        item.attributedTitle = NSAttributedString(string: reconnecting ? "Reconnecting…" : "Reconnect to Claude", attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: reconnecting ? NSColor.secondaryLabelColor : claudeCoral,
+        ])
+        menu.addItem(item)
+    }
+
+    // Runs Claude Code's official sign-in to revive the login, then refreshes.
+    // Opens the browser, which completes on its own if signed in to claude.com.
+    @objc func reconnectAction() {
+        if reconnecting { return }
+        reconnecting = true
+        rebuildMenu()
+        updateButton()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let ok = self?.fetcher.credentials.reconnectViaClaudeCLI() ?? false
+            DispatchQueue.main.async {
+                self?.reconnecting = false
+                if ok { self?.lastError = nil }
+                self?.refreshUsage()
+                self?.refreshModels()
+                self?.refreshSpend()
+                if !ok {
+                    NSApp.activate(ignoringOtherApps: true)
+                    let alert = NSAlert()
+                    alert.messageText = "Could not reconnect automatically"
+                    alert.informativeText = "Open Claude Code (or the Claude desktop app's Code tab), sign in once, then click Reconnect again."
+                    alert.runModal()
+                }
+            }
+        }
     }
 
     // Re-creates the status item with a position hint that puts it as far
