@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION="1.0.3"
+VERSION="1.0.7"
 NAME="Pulse for Claude"
 BUNDLE_ID="club.everydayai.pulse"
 BUILD_DIR="build"
@@ -58,8 +58,12 @@ if [ -f "assets/AppIcon.icns" ]; then
   cp "assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi
 
-echo "[4/5] Signing (ad-hoc)..."
-codesign --force --deep -s - "$APP"
+echo "[4/5] Signing..."
+IDENTITY="-"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Pulse for Claude Dev"; then
+  IDENTITY="Pulse for Claude Dev"
+fi
+codesign --force --deep -s "$IDENTITY" "$APP"
 
 echo "[5/5] Zipping release..."
 mkdir -p dist

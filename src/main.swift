@@ -8,7 +8,7 @@ import Security
 import ServiceManagement
 
 let APP_NAME = "Pulse for Claude"
-let APP_VERSION = "1.0.3"
+let APP_VERSION = "1.0.7"
 let USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 let TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 let COST_URL = "https://api.anthropic.com/v1/organizations/cost_report"
@@ -53,6 +53,25 @@ func timeLeftString(until date: Date) -> String {
     if days > 0 { return "\(days)d \(hours)h" }
     if hours > 0 { return "\(hours)h \(mins)m" }
     return "\(mins)m"
+}
+
+func nextMonthResetLabel() -> String {
+    let calendar = Calendar.current
+    let now = Date()
+    let comps = calendar.dateComponents([.year, .month], from: now)
+    guard let startOfThisMonth = calendar.date(from: comps) else { return "" }
+    guard let startOfNextMonth = calendar.date(byAdding: .month, value: 1, to: startOfThisMonth) else { return "" }
+    let formatter = DateFormatter()
+    formatter.dateFormat = "MMM d"
+    return formatter.string(from: startOfNextMonth)
+}
+
+// Turns an optional into a JSONSerialization-safe value, NSNull when nil,
+// so status.json always has every key with a sensible null instead of
+// crashing or omitting the key.
+func jsonValue<T>(_ v: T?) -> Any {
+    if let v = v { return v }
+    return NSNull()
 }
 
 func thresholdColor(_ pct: Double) -> NSColor {
@@ -143,12 +162,17 @@ struct UsageBucket {
     let label: String
     let utilization: Double
     let resetsAt: Date?
+    let severity: String?
+    let isActive: Bool
 }
 
 struct ExtraUsage {
     let usedCents: Double
     let limitCents: Double
     let currency: String
+    let percent: Double?
+    let severity: String?
+    let balanceCents: Double?
 }
 
 struct UsageSnapshot {
@@ -174,12 +198,14 @@ enum PulseError: Error, CustomStringConvertible {
     case noCredentials
     case loginExpired
     case network(String)
+    case rateLimited
 
     var description: String {
         switch self {
         case .noCredentials: return "No Claude login found"
         case .loginExpired: return "Claude login expired"
         case .network(let m): return m
+        case .rateLimited: return "Rate limited, showing last known usage"
         }
     }
 }
@@ -282,31 +308,48 @@ final class Credentials {
         loadLocked(allowSeed: false)
         if !accessToken.isEmpty && !isExpiredLocked { return .success(accessToken) }
         if refreshToken.isEmpty {
+            // Genuine first run only: the file has never held a token at all.
+            // This is the one legitimate case for reading Claude Code's
+            // keychain item, so it is also the one case that may prompt.
             loadLocked(allowSeed: true)
             if !accessToken.isEmpty && !isExpiredLocked { return .success(accessToken) }
             if refreshToken.isEmpty { return .failure(.noCredentials) }
         }
 
-        var lastError = PulseError.loginExpired
-        for attempt in 0..<2 {
-            if attempt > 0 {
-                // Our refresh token was rejected (already spent, or Claude Code
-                // rotated it). Re-seed from Claude Code's item and retry once.
-                loadLocked(allowSeed: true)
-                if !accessToken.isEmpty && !isExpiredLocked { return .success(accessToken) }
+        switch postRefresh(refreshToken) {
+        case .success(let t):
+            accessToken = t.access
+            refreshToken = t.refresh
+            expiresAt = t.exp
+            writeBackLocked()
+            return .success(accessToken)
+        case .failure(let e):
+            // Our refresh token was rejected, most likely Claude Code CLI
+            // refreshed the same shared token first (a race around sleep/
+            // wake or a concurrent CLI session) and ours is now stale.
+            // Re-seed from Claude Code's keychain item exactly once and
+            // retry, rather than immediately surfacing loginExpired and
+            // making the user click Reconnect. This differs from the old
+            // per-load re-seed (removed in 1.0.2) that caused a recurring
+            // wake prompt: that one fired on every expired-looking load,
+            // this one fires only after a real rejection, at most once
+            // per refresh attempt.
+            let before = refreshToken
+            loadLocked(allowSeed: true)
+            if refreshToken != before && !refreshToken.isEmpty {
+                switch postRefresh(refreshToken) {
+                case .success(let t):
+                    accessToken = t.access
+                    refreshToken = t.refresh
+                    expiresAt = t.exp
+                    writeBackLocked()
+                    return .success(accessToken)
+                case .failure(let e2):
+                    return .failure(e2)
+                }
             }
-            switch postRefresh(refreshToken) {
-            case .success(let t):
-                accessToken = t.access
-                refreshToken = t.refresh
-                expiresAt = t.exp
-                writeBackLocked()
-                return .success(accessToken)
-            case .failure(let e):
-                lastError = e
-            }
+            return .failure(e)
         }
-        return .failure(lastError)
     }
 
     private struct NewToken { let access: String; let refresh: String; let exp: Double }
@@ -451,6 +494,7 @@ final class UsageFetcher {
             return .failure(.network("No response"))
         }
         if http.statusCode == 401 || http.statusCode == 403 { return .failure(.loginExpired) }
+        if http.statusCode == 429 { return .failure(.rateLimited) }
         guard http.statusCode == 200 else { return .failure(.network("HTTP \(http.statusCode)")) }
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return .failure(.network("Bad usage response"))
@@ -458,32 +502,141 @@ final class UsageFetcher {
         return .success(parse(json))
     }
 
-    // Dynamic parser: any object in the response that carries a numeric
-    // "utilization" becomes a bar. New buckets Anthropic ships show up
-    // automatically without an app update.
-    private func parse(_ json: [String: Any]) -> UsageSnapshot {
+    // Bucket key for one entry of the new top-level "limits" array. Maps each
+    // "kind" to the same stable keys the old per-object fields used, so saved
+    // icon preferences (which reference these keys) keep working.
+    private func limitBucketKey(_ entry: [String: Any]) -> String {
+        let kind = (entry["kind"] as? String) ?? "unknown"
+        switch kind {
+        case "session":
+            return "five_hour"
+        case "weekly_all":
+            return "seven_day"
+        case "weekly_scoped":
+            let scope = entry["scope"] as? [String: Any]
+            if let model = scope?["model"] as? [String: Any],
+               let display = model["display_name"] as? String, !display.isEmpty {
+                return "seven_day_" + display.lowercased()
+            }
+            if let surface = scope?["surface"] as? String, !surface.isEmpty {
+                return "seven_day_" + surface.lowercased()
+            }
+            return "seven_day_scoped"
+        default:
+            return kind
+        }
+    }
+
+    // Primary path: parses the "limits" array Anthropic now sends. Each entry
+    // uses "percent" instead of "utilization". Falls back to the old
+    // utilization-scan below when "limits" is missing or empty.
+    private func parseLimits(_ limits: [[String: Any]]) -> [UsageBucket] {
         var buckets: [UsageBucket] = []
-        var extra: ExtraUsage?
+        for entry in limits {
+            guard let pct = (entry["percent"] as? NSNumber)?.doubleValue else { continue }
+            let key = limitBucketKey(entry)
+            buckets.append(UsageBucket(
+                key: key,
+                label: prettyBucketLabel(key),
+                utilization: max(0, min(100, pct)),
+                resetsAt: iso8601Date(entry["resets_at"] as? String),
+                severity: entry["severity"] as? String,
+                isActive: (entry["is_active"] as? Bool) ?? false))
+        }
+        return buckets
+    }
+
+    // Fallback parser (pre-"limits" API shape): any object in the response
+    // that carries a numeric "utilization" becomes a bar. New buckets
+    // Anthropic ships show up automatically without an app update.
+    private func parseUtilizationScan(_ json: [String: Any]) -> [UsageBucket] {
+        var buckets: [UsageBucket] = []
         for (key, value) in json {
             guard let dict = value as? [String: Any] else { continue }
-            if key == "extra_usage" {
-                let enabled = (dict["is_enabled"] as? Bool) ?? false
-                let limit = (dict["monthly_limit"] as? NSNumber)?.doubleValue ?? 0
-                if enabled && limit > 0 {
-                    extra = ExtraUsage(
-                        usedCents: (dict["used_credits"] as? NSNumber)?.doubleValue ?? 0,
-                        limitCents: limit,
-                        currency: (dict["currency"] as? String) ?? "USD")
-                }
-                continue
-            }
+            if key == "extra_usage" { continue }
             guard let util = (dict["utilization"] as? NSNumber)?.doubleValue else { continue }
             buckets.append(UsageBucket(
                 key: key,
                 label: prettyBucketLabel(key),
                 utilization: max(0, min(100, util)),
-                resetsAt: iso8601Date(dict["resets_at"] as? String)))
+                resetsAt: iso8601Date(dict["resets_at"] as? String),
+                severity: nil,
+                isActive: false))
         }
+        return buckets
+    }
+
+    // Preferred path: the richer top-level "spend" object. Broken into small
+    // intermediate lets on purpose, the swiftc type checker on this machine
+    // has hung on complex chained optional casts involving NSNumber.
+    private func parseSpend(_ json: [String: Any]) -> ExtraUsage? {
+        guard let spend = json["spend"] as? [String: Any] else { return nil }
+        let enabled = (spend["enabled"] as? Bool) ?? false
+        guard enabled else { return nil }
+        guard let usedDict = spend["used"] as? [String: Any] else { return nil }
+        let usedNumber = usedDict["amount_minor"] as? NSNumber
+        let usedCents = usedNumber?.doubleValue ?? 0
+
+        var limitCents: Double = 0
+        if let limitDict = spend["limit"] as? [String: Any] {
+            let limitNumber = limitDict["amount_minor"] as? NSNumber
+            limitCents = limitNumber?.doubleValue ?? 0
+        }
+
+        let currency = (usedDict["currency"] as? String) ?? "USD"
+        let percentNumber = spend["percent"] as? NSNumber
+        let percent = percentNumber?.doubleValue
+        let severity = spend["severity"] as? String
+
+        var balanceCents: Double? = nil
+        if let balanceDict = spend["balance"] as? [String: Any] {
+            let balanceNumber = balanceDict["amount_minor"] as? NSNumber
+            balanceCents = balanceNumber?.doubleValue
+        }
+
+        return ExtraUsage(
+            usedCents: usedCents,
+            limitCents: limitCents,
+            currency: currency,
+            percent: percent,
+            severity: severity,
+            balanceCents: balanceCents)
+    }
+
+    // Fallback path: the older "extra_usage" object. Now also tolerates a
+    // null/missing monthly_limit (treated as 0, meaning "no cap") as long as
+    // the feature is enabled and a used_credits value is present.
+    private func parseExtraUsage(_ json: [String: Any]) -> ExtraUsage? {
+        guard let dict = json["extra_usage"] as? [String: Any] else { return nil }
+        let enabled = (dict["is_enabled"] as? Bool) ?? false
+        guard enabled else { return nil }
+        guard let usedNumber = dict["used_credits"] as? NSNumber else { return nil }
+        let usedCents = usedNumber.doubleValue
+        let limitNumber = dict["monthly_limit"] as? NSNumber
+        let limitCents = limitNumber?.doubleValue ?? 0
+        let currency = (dict["currency"] as? String) ?? "USD"
+        return ExtraUsage(
+            usedCents: usedCents,
+            limitCents: limitCents,
+            currency: currency,
+            percent: nil,
+            severity: nil,
+            balanceCents: nil)
+    }
+
+    private func parse(_ json: [String: Any]) -> UsageSnapshot {
+        var buckets: [UsageBucket]
+        if let limits = json["limits"] as? [[String: Any]], !limits.isEmpty {
+            buckets = parseLimits(limits)
+        } else {
+            buckets = parseUtilizationScan(json)
+        }
+
+        var extra: ExtraUsage? = parseSpend(json)
+        if extra == nil {
+            extra = parseExtraUsage(json)
+        }
+
         let order = ["five_hour", "seven_day"]
         buckets.sort { a, b in
             let ia = order.firstIndex(of: a.key) ?? Int.max
@@ -838,6 +991,60 @@ func barRow(label: String, pct: Double, sub: String?, fillColor: NSColor? = nil)
     return view
 }
 
+// A menu row backed by a real NSButton instead of an NSMenuItem selection.
+// AppKit dismisses the menu automatically whenever an NSMenuItem's action
+// fires, that's what made "Refresh Now" close the dropdown on every click.
+// A button living inside an NSMenuItem's custom view does not trigger that
+// dismissal, so the menu stays open, matching Track API Spend and the other
+// action rows in feel while behaving like the always-visible utility item
+// it is meant to be. Keeps the same target/action wiring as a normal item,
+// so nothing about what runs on click changes, only whether the menu closes.
+func menuButtonRow(title: String, keyEquivalent: String, target: AnyObject, action: Selector) -> NSView {
+    let width: CGFloat = 264
+    let height: CGFloat = 22
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+    let button = NSButton(frame: NSRect(x: 0, y: 0, width: width, height: height))
+    button.title = title
+    button.bezelStyle = .inline
+    button.isBordered = false
+    button.font = .systemFont(ofSize: 13, weight: .regular)
+    button.alignment = .left
+    button.contentTintColor = .labelColor
+    (button.cell as? NSButtonCell)?.imagePosition = .noImage
+    button.target = target
+    button.action = action
+    button.setButtonType(.momentaryChange)
+    // NSMenu's key-equivalent tracking checks each visible item's view for a
+    // button with a matching keyEquivalent, so ⌘R still fires while the menu
+    // is open, same as it did as a plain NSMenuItem keyEquivalent.
+    if !keyEquivalent.isEmpty {
+        button.keyEquivalent = keyEquivalent
+        button.keyEquivalentModifierMask = .command
+    }
+    view.addSubview(button)
+
+    // Keep the ⌘R hint visible on the right, matching how NSMenuItem shows
+    // key equivalents, even though this row is no longer a real menu item.
+    if !keyEquivalent.isEmpty {
+        let hint = NSTextField(labelWithString: "⌘" + keyEquivalent.uppercased())
+        hint.font = .systemFont(ofSize: 12)
+        hint.textColor = .tertiaryLabelColor
+        hint.alignment = .right
+        hint.frame = NSRect(x: width - 40, y: 2, width: 26, height: 16)
+        hint.isEditable = false
+        hint.isSelectable = false
+        view.addSubview(hint)
+        button.frame = NSRect(x: 0, y: 0, width: width - 44, height: height)
+    }
+
+    // Indent to match NSMenuItem's default title inset.
+    button.frame.origin.x = 14
+    button.frame.size.width -= 14
+
+    return view
+}
+
 // MARK: - App controller
 
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -853,6 +1060,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pulsePhase = false
     var sparkPhase = false
     var reconnecting = false
+    private var lastFetchAt = Date.distantPast
     static let positionKey = "NSStatusItem Preferred Position Pulse"
 
     var iconStyle: IconStyle {
@@ -862,6 +1070,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var iconMetric: IconMetric {
         get { IconMetric(rawValue: UserDefaults.standard.string(forKey: "iconMetric") ?? "") ?? .fiveHour }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "iconMetric") }
+    }
+
+    // Manual anchor for counting down purchased credits, since the OAuth
+    // usage API does not yet expose a live balance. 0 means unset.
+    var anchorBalanceCents: Double {
+        get { UserDefaults.standard.double(forKey: "CreditsAnchorBalanceCents") }
+        set { UserDefaults.standard.set(newValue, forKey: "CreditsAnchorBalanceCents") }
+    }
+    var anchorUsedCents: Double {
+        get { UserDefaults.standard.double(forKey: "CreditsAnchorUsedCents") }
+        set { UserDefaults.standard.set(newValue, forKey: "CreditsAnchorUsedCents") }
     }
 
     func makeStatusItem() {
@@ -887,7 +1106,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshModels()
         refreshSpend()
 
-        let usageTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.refreshUsage() }
+        let usageTimer = Timer(timeInterval: 120, repeats: true) { [weak self] _ in self?.refreshUsage() }
         RunLoop.main.add(usageTimer, forMode: .common)
         let modelsTimer = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
             self?.refreshModels()
@@ -928,20 +1147,77 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: refreshes
 
-    func refreshUsage() {
+    func refreshUsage(force: Bool = false) {
+        if !force && Date().timeIntervalSince(lastFetchAt) < 5 { return }
+        lastFetchAt = Date()
         fetcher.fetch { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                var rateLimited = false
                 switch result {
                 case .success(let snap):
                     self.snapshot = snap
                     self.lastError = nil
+                case .failure(.rateLimited):
+                    // Rate limited: keep showing the last good snapshot, do
+                    // not treat this as an error, just wait for next poll.
+                    rateLimited = true
                 case .failure(let err):
                     self.lastError = err
                 }
                 self.updateButton()
                 self.rebuildMenu()
+                self.writeStatusFile(rateLimited: rateLimited)
             }
+        }
+    }
+
+    // Best-effort health file for external checks (cat, monitoring scripts).
+    // Piggybacks on the existing poll, no extra network calls. Never throws,
+    // never crashes the app, a missing or stale file just reads as unhealthy.
+    private func writeStatusFile(rateLimited: Bool) {
+        let dir = NSString(string: "~/Library/Application Support/Pulse for Claude").expandingTildeInPath
+        let path = dir + "/status.json"
+
+        var bucketKeys: [String] = []
+        var bucketLabels: [String] = []
+        var extraUsedDollars: Double? = nil
+        var creditsBalanceDollars: Double? = nil
+        if let snap = snapshot {
+            bucketKeys = snap.buckets.map { $0.key }
+            bucketLabels = snap.buckets.map { $0.label }
+            if let extra = snap.extra {
+                extraUsedDollars = extra.usedCents / 100
+                var balanceCents: Double? = nil
+                if let apiBalance = extra.balanceCents {
+                    balanceCents = apiBalance
+                } else if anchorBalanceCents > 0 {
+                    let usedSinceAnchor = extra.usedCents - anchorUsedCents
+                    let usedSinceAnchorClamped = max(0, usedSinceAnchor)
+                    let remaining = anchorBalanceCents - usedSinceAnchorClamped
+                    balanceCents = max(0, remaining)
+                }
+                if let bc = balanceCents { creditsBalanceDollars = bc / 100 }
+            }
+        }
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let payload: [String: Any] = [
+            "version": APP_VERSION,
+            "updatedAt": iso.string(from: Date()),
+            "healthy": snapshot != nil && lastError == nil,
+            "lastError": jsonValue(lastError?.description),
+            "bucketKeys": bucketKeys,
+            "bucketLabels": bucketLabels,
+            "extraUsedDollars": jsonValue(extraUsedDollars),
+            "creditsBalanceDollars": jsonValue(creditsBalanceDollars),
+            "rateLimited": rateLimited,
+        ]
+
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys, .prettyPrinted]) {
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
         }
     }
 
@@ -1026,6 +1302,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         header.isEnabled = false
         menu.addItem(header)
 
+        let refreshNow = NSMenuItem()
+        refreshNow.view = menuButtonRow(title: "Refresh Now", keyEquivalent: "r", target: self, action: #selector(manualRefresh))
+        menu.addItem(refreshNow)
+        menu.addItem(.separator())
+
         if reconnecting {
             menu.addItem(infoItem("Reconnecting to Claude…"))
         } else if let err = lastError, snapshot == nil {
@@ -1039,6 +1320,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 addReconnectItem()
             case .network:
                 menu.addItem(infoItem("Check your internet connection, then Refresh."))
+            case .rateLimited:
+                menu.addItem(infoItem("Anthropic is rate limiting requests. Waiting for the next poll."))
             }
         }
 
@@ -1048,17 +1331,83 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let r = bucket.resetsAt, r.timeIntervalSinceNow > 0 {
                     sub = "resets in " + timeLeftString(until: r)
                 }
+                if bucket.isActive {
+                    let activeSuffix = "· active"
+                    sub = sub == nil ? activeSuffix : sub! + " " + activeSuffix
+                }
                 let item = NSMenuItem()
                 item.view = barRow(label: bucket.label, pct: bucket.utilization, sub: sub)
                 menu.addItem(item)
             }
             if let extra = snap.extra {
-                let pct = extra.limitCents > 0 ? (extra.usedCents / extra.limitCents) * 100 : 0
                 let used = String(format: "$%.2f", extra.usedCents / 100)
-                let limit = String(format: "$%.2f", extra.limitCents / 100)
+                var fillColor = claudeCoral
+                if extra.severity == "warning" { fillColor = .systemOrange }
+                else if extra.severity == "critical" { fillColor = .systemRed }
+
+                let pct: Double
+                let sub: String
+                if extra.limitCents > 0 {
+                    pct = extra.percent ?? ((extra.usedCents / extra.limitCents) * 100)
+                    let limit = String(format: "$%.2f", extra.limitCents / 100)
+                    sub = "\(used) of \(limit) extra usage"
+                } else {
+                    pct = 0
+                    let resetLabel = nextMonthResetLabel()
+                    sub = "\(used) used this month · no cap · resets \(resetLabel)"
+                }
                 let item = NSMenuItem()
-                item.view = barRow(label: "Usage credits", pct: pct, sub: "\(used) of \(limit) extra usage", fillColor: claudeCoral)
+                item.view = barRow(label: "Usage credits", pct: pct, sub: sub, fillColor: fillColor)
                 menu.addItem(item)
+
+                // Credits balance row: prefer the API-provided balance once
+                // Anthropic wires it up. Until then, fall back to counting
+                // down from the manual anchor the user set once.
+                var balanceCents: Double? = nil
+                var anchorTotal: Double = 0
+                if let apiBalance = extra.balanceCents {
+                    balanceCents = apiBalance
+                } else if anchorBalanceCents > 0 {
+                    let usedSinceAnchor = extra.usedCents - anchorUsedCents
+                    let usedSinceAnchorClamped = max(0, usedSinceAnchor)
+                    let remaining = anchorBalanceCents - usedSinceAnchorClamped
+                    let remainingClamped = max(0, remaining)
+                    balanceCents = remainingClamped
+                    anchorTotal = anchorBalanceCents
+                }
+
+                if let balance = balanceCents {
+                    let balancePct: Double
+                    if anchorTotal > 0 {
+                        let ratio = balance / anchorTotal
+                        let rawPct = ratio * 100
+                        balancePct = max(0, min(100, rawPct))
+                    } else {
+                        balancePct = 100
+                    }
+
+                    let balanceStr = String(format: "$%.2f", balance / 100)
+                    let balanceSub: String
+                    if anchorTotal > 0 {
+                        let totalStr = String(format: "$%.2f", anchorTotal / 100)
+                        balanceSub = "\(balanceStr) left of \(totalStr)"
+                    } else {
+                        balanceSub = "\(balanceStr) left"
+                    }
+
+                    var balanceColor = NSColor.systemGreen
+                    if balancePct > 30 {
+                        balanceColor = .systemGreen
+                    } else if balancePct > 10 {
+                        balanceColor = .systemOrange
+                    } else {
+                        balanceColor = .systemRed
+                    }
+
+                    let balanceItem = NSMenuItem()
+                    balanceItem.view = barRow(label: "Credits balance", pct: balancePct, sub: balanceSub, fillColor: balanceColor)
+                    menu.addItem(balanceItem)
+                }
             }
             if let stalenessErr = lastError, !reconnecting {
                 menu.addItem(infoItem("Last update failed: \(stalenessErr.description)"))
@@ -1101,6 +1450,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(add)
         }
 
+        let setBalance = NSMenuItem(title: "Set Credits Balance…", action: #selector(setCreditsBalance), keyEquivalent: "")
+        setBalance.target = self
+        menu.addItem(setBalance)
+
         // settings
         menu.addItem(.separator())
         let styleMenu = NSMenu()
@@ -1138,10 +1491,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(login)
         }
 
-        let refresh = NSMenuItem(title: "Refresh Now", action: #selector(manualRefresh), keyEquivalent: "r")
-        refresh.target = self
-        menu.addItem(refresh)
-
         let reconnectItem = NSMenuItem(title: "Reconnect to Claude", action: #selector(reconnectAction), keyEquivalent: "")
         reconnectItem.target = self
         reconnectItem.isEnabled = !reconnecting
@@ -1155,7 +1504,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let snap = snapshot {
             let df = DateFormatter()
             df.dateFormat = "h:mm a"
-            menu.addItem(infoItem("Updated \(df.string(from: snap.fetchedAt)) · refreshes every minute"))
+            menu.addItem(infoItem("Updated \(df.string(from: snap.fetchedAt)) · refreshes every 2 minutes"))
         }
         let about = NSMenuItem(title: "About \(APP_NAME)", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
@@ -1219,7 +1568,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             reconnectAction()
             return
         }
-        refreshUsage()
+        refreshUsage(force: true)
         refreshModels()
         refreshSpend()
     }
@@ -1248,7 +1597,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 self?.reconnecting = false
                 if ok { self?.lastError = nil }
-                self?.refreshUsage()
+                self?.refreshUsage(force: true)
                 self?.refreshModels()
                 self?.refreshSpend()
                 if !ok {
@@ -1299,6 +1648,39 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         APISpend.removeKey()
         spendLine = ""
         rebuildMenu()
+    }
+
+    // Manual anchor entry point. Pulse cannot read a live balance from the
+    // API yet (spend.balance is null as of this writing), so the user gives
+    // us a starting point once and we count it down from spend deltas.
+    @objc func setCreditsBalance() {
+        guard let snap = snapshot, let extra = snap.extra else {
+            NSApp.activate(ignoringOtherApps: true)
+            let waitAlert = NSAlert()
+            waitAlert.messageText = "Not ready yet"
+            waitAlert.informativeText = "Usage data has not loaded yet. Wait for the next refresh and try again."
+            waitAlert.runModal()
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Set Credits Balance"
+        alert.informativeText = "Enter your current balance from claude.ai (Settings, Usage). Pulse will count it down as you spend."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+        field.placeholderString = "74.29"
+        alert.accessoryView = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            var text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            text = text.replacingOccurrences(of: "$", with: "")
+            text = text.replacingOccurrences(of: " ", with: "")
+            guard let dollars = Double(text) else { return }
+            anchorBalanceCents = dollars * 100
+            anchorUsedCents = extra.usedCents
+            rebuildMenu()
+        }
     }
 
     @objc func showAbout() {
