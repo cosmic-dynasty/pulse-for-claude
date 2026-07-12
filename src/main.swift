@@ -8,7 +8,7 @@ import Security
 import ServiceManagement
 
 let APP_NAME = "Pulse for Claude"
-let APP_VERSION = "1.0.7"
+let APP_VERSION = "1.0.8"
 let USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 let TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 let COST_URL = "https://api.anthropic.com/v1/organizations/cost_report"
@@ -23,6 +23,8 @@ let PULSE_KEYCHAIN_SERVICE = "club.everydayai.pulse"
 let PULSE_CRED_SERVICE = "Pulse for Claude-credentials"
 let CRED_FILE = NSString(string: "~/.claude/.credentials.json").expandingTildeInPath
 let PROJECTS_DIR = NSString(string: "~/.claude/projects").expandingTildeInPath
+let RETRY_DELAYS: [TimeInterval] = [2, 5, 15]
+let USAGE_CACHE_TTL: TimeInterval = 45
 
 // MARK: - Small helpers
 
@@ -72,6 +74,18 @@ func nextMonthResetLabel() -> String {
 func jsonValue<T>(_ v: T?) -> Any {
     if let v = v { return v }
     return NSNull()
+}
+
+func relativeAgeString(_ d: Date) -> String {
+    let age = Int(Date().timeIntervalSince(d))
+    if age < 60 { return "just now" }
+    if age < 3600 {
+        let mins = age / 60
+        return "\(mins)m ago"
+    }
+    let hours = age / 3600
+    let mins = (age % 3600) / 60
+    return "\(hours)h \(mins)m ago"
 }
 
 func thresholdColor(_ pct: Double) -> NSColor {
@@ -199,6 +213,7 @@ enum PulseError: Error, CustomStringConvertible {
     case loginExpired
     case network(String)
     case rateLimited
+    case httpError(Int)
 
     var description: String {
         switch self {
@@ -206,6 +221,16 @@ enum PulseError: Error, CustomStringConvertible {
         case .loginExpired: return "Claude login expired"
         case .network(let m): return m
         case .rateLimited: return "Rate limited, showing last known usage"
+        case .httpError(let code): return "HTTP error \(code)"
+        }
+    }
+
+    var isTransient: Bool {
+        switch self {
+        case .network, .httpError:
+            return true
+        case .noCredentials, .loginExpired, .rateLimited:
+            return false
         }
     }
 }
@@ -495,7 +520,7 @@ final class UsageFetcher {
         }
         if http.statusCode == 401 || http.statusCode == 403 { return .failure(.loginExpired) }
         if http.statusCode == 429 { return .failure(.rateLimited) }
-        guard http.statusCode == 200 else { return .failure(.network("HTTP \(http.statusCode)")) }
+        guard http.statusCode == 200 else { return .failure(.httpError(http.statusCode)) }
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return .failure(.network("Bad usage response"))
         }
@@ -1055,12 +1080,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var snapshot: UsageSnapshot?
     var lastError: PulseError?
+    var lastSuccessAt: Date?
     var models: [ModelStat] = []
     var spendLine: String = ""
     var pulsePhase = false
     var sparkPhase = false
     var reconnecting = false
     private var lastFetchAt = Date.distantPast
+    private var usageRetryAttempt = 0
+    private var usageRetryWork: DispatchWorkItem?
     static let positionKey = "NSStatusItem Preferred Position Pulse"
 
     var iconStyle: IconStyle {
@@ -1148,7 +1176,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: refreshes
 
     func refreshUsage(force: Bool = false) {
-        if !force && Date().timeIntervalSince(lastFetchAt) < 5 { return }
+        if !force {
+            // TTL cache: if data is fresh enough, skip the fetch entirely.
+            if let s = lastSuccessAt, Date().timeIntervalSince(s) < USAGE_CACHE_TTL, snapshot != nil, lastError == nil { return }
+            // Hammer guard: prevent sub-5s refetch thrashing.
+            if Date().timeIntervalSince(lastFetchAt) < 5 { return }
+        }
         lastFetchAt = Date()
         fetcher.fetch { [weak self] result in
             DispatchQueue.main.async {
@@ -1158,12 +1191,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .success(let snap):
                     self.snapshot = snap
                     self.lastError = nil
+                    self.lastSuccessAt = Date()
+                    self.usageRetryAttempt = 0
+                    self.usageRetryWork?.cancel()
+                    self.usageRetryWork = nil
                 case .failure(.rateLimited):
                     // Rate limited: keep showing the last good snapshot, do
                     // not treat this as an error, just wait for next poll.
                     rateLimited = true
                 case .failure(let err):
                     self.lastError = err
+                    // Retry transient failures only (network, HTTP 5xx).
+                    if err.isTransient && self.usageRetryAttempt < RETRY_DELAYS.count {
+                        self.usageRetryWork?.cancel()
+                        let work = DispatchWorkItem { [weak self] in
+                            self?.refreshUsage(force: true)
+                        }
+                        self.usageRetryWork = work
+                        let delay = RETRY_DELAYS[self.usageRetryAttempt]
+                        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+                        self.usageRetryAttempt += 1
+                    }
                 }
                 self.updateButton()
                 self.rebuildMenu()
@@ -1203,6 +1251,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var lastSuccessStr: Any = NSNull()
+        if let lsa = lastSuccessAt { lastSuccessStr = iso.string(from: lsa) }
         let payload: [String: Any] = [
             "version": APP_VERSION,
             "updatedAt": iso.string(from: Date()),
@@ -1213,6 +1263,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "extraUsedDollars": jsonValue(extraUsedDollars),
             "creditsBalanceDollars": jsonValue(creditsBalanceDollars),
             "rateLimited": rateLimited,
+            "lastSuccessAt": lastSuccessStr,
         ]
 
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -1322,6 +1373,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(infoItem("Check your internet connection, then Refresh."))
             case .rateLimited:
                 menu.addItem(infoItem("Anthropic is rate limiting requests. Waiting for the next poll."))
+            case .httpError:
+                menu.addItem(infoItem("Server error. Retrying automatically."))
             }
         }
 
@@ -1410,7 +1463,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             if let stalenessErr = lastError, !reconnecting {
-                menu.addItem(infoItem("Last update failed: \(stalenessErr.description)"))
+                var msg = "Last update failed: \(stalenessErr.description)"
+                if let lsa = lastSuccessAt {
+                    msg += " · data \(relativeAgeString(lsa))"
+                }
+                menu.addItem(infoItem(msg))
                 if case .loginExpired = stalenessErr { addReconnectItem() }
             } else if reconnecting {
                 menu.addItem(infoItem("Reconnecting to Claude…"))
@@ -1504,7 +1561,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let snap = snapshot {
             let df = DateFormatter()
             df.dateFormat = "h:mm a"
-            menu.addItem(infoItem("Updated \(df.string(from: snap.fetchedAt)) · refreshes every 2 minutes"))
+            var footer = "Updated \(df.string(from: snap.fetchedAt)) · refreshes every 2 minutes"
+            // Add staleness indicator if data is older than 10 minutes (missed polls).
+            if let lsa = lastSuccessAt, lastError == nil, Date().timeIntervalSince(lsa) >= 600 {
+                footer += " · data \(relativeAgeString(lsa))"
+            }
+            menu.addItem(infoItem(footer))
         }
         let about = NSMenuItem(title: "About \(APP_NAME)", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
@@ -1568,6 +1630,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             reconnectAction()
             return
         }
+        // Cancel any pending retry work and reset the retry counter.
+        usageRetryWork?.cancel()
+        usageRetryWork = nil
+        usageRetryAttempt = 0
         refreshUsage(force: true)
         refreshModels()
         refreshSpend()
