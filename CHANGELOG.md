@@ -2,6 +2,10 @@
 
 *Created: July 12, 2026 at 5:23 PM CDT*
 
+## v1.0.9 (2026-07-12)
+
+- **Paste works in dialogs** - Cmd+V (and cut/copy/select all/undo) now work in the "Track API Spend" and "Set Credits Balance" text fields. Menu bar apps have no Edit menu, so macOS had nowhere to route the paste shortcut; Pulse now installs a hidden one at launch.
+
 ## v1.0.8 (2026-07-12)
 
 - **Staleness timestamps** - Menu footer now shows "data 4m ago" when polls are missed (sleep, network pause). Error states also display age when showing old data.

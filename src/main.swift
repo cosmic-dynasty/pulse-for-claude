@@ -8,7 +8,7 @@ import Security
 import ServiceManagement
 
 let APP_NAME = "Pulse for Claude"
-let APP_VERSION = "1.0.8"
+let APP_VERSION = "1.0.9"
 let USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 let TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 let COST_URL = "https://api.anthropic.com/v1/organizations/cost_report"
@@ -1119,8 +1119,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
     }
 
+    // Accessory apps have no visible menu bar menus, but AppKit still routes
+    // Cmd+V/C/X/A through NSApp.mainMenu key equivalents. Without this hidden
+    // Edit menu, paste does not work in any NSAlert text field (the Track API
+    // Spend and Set Credits Balance dialogs).
+    private func installHiddenEditMenu() {
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installHiddenEditMenu()
         // First run: ask macOS to place us as far right as third-party
         // items are allowed to go (small value = closer to the clock).
         if UserDefaults.standard.object(forKey: AppController.positionKey) == nil {
